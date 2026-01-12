@@ -1,6 +1,6 @@
 import { connect } from 'cloudflare:sockets';
 
-// ============ 常量 ============
+// ============ 常量（编译时内联） ============
 const UUID = new Uint8Array([
   0x55, 0xd9, 0xec, 0x38, 0x1b, 0x8a, 0x45, 0x4b,
   0x98, 0x1a, 0x6a, 0xcf, 0xe8, 0xf5, 0x6d, 0x8c
@@ -15,19 +15,20 @@ const BATCH_HI = 8;
 const BATCH_LO = 2;
 const BP_LIMIT = 20;
 const TIMEOUT = 2000;
-const Q_MAX = 32;
+const Q_SHIFT = 5;
+const Q_SIZE = 32;
+const Q_MASK = 31;
 const QB_MAX = 262144;
 
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
-const VHDR = new Uint8Array([0, 0]);
 
 const R400 = new Response(null, {status: 400});
 const R403 = new Response(null, {status: 403});
 const R426 = new Response(null, {status: 426, headers: {Upgrade: 'websocket'}});
 const R502 = new Response(null, {status: 502});
 
-// ============ 单态结果对象 ============
+// ============ 单态对象（内存对齐） ============
 function VLESSResult() {
   this.ok = false;
   this.host = '';
@@ -38,7 +39,7 @@ function VLESSResult() {
 const VFAIL = Object.freeze(new VLESSResult());
 const B64FAIL = new Uint8Array(0);
 
-// ============ Base64 解码 ============
+// ============ Base64（16字节展开 + 分支消除） ============
 function b64dec(s) {
   let bin;
   try {
@@ -51,10 +52,10 @@ function b64dec(s) {
   if (len === 0) return B64FAIL;
   
   const out = new Uint8Array(len);
-  const end8 = (len & ~7) | 0;
+  const end16 = (len & ~15) | 0;
   
   let i = 0;
-  while (i < end8) {
+  while (i < end16) {
     out[i] = bin.charCodeAt(i) | 0;
     out[i+1] = bin.charCodeAt(i+1) | 0;
     out[i+2] = bin.charCodeAt(i+2) | 0;
@@ -63,7 +64,15 @@ function b64dec(s) {
     out[i+5] = bin.charCodeAt(i+5) | 0;
     out[i+6] = bin.charCodeAt(i+6) | 0;
     out[i+7] = bin.charCodeAt(i+7) | 0;
-    i = (i + 8) | 0;
+    out[i+8] = bin.charCodeAt(i+8) | 0;
+    out[i+9] = bin.charCodeAt(i+9) | 0;
+    out[i+10] = bin.charCodeAt(i+10) | 0;
+    out[i+11] = bin.charCodeAt(i+11) | 0;
+    out[i+12] = bin.charCodeAt(i+12) | 0;
+    out[i+13] = bin.charCodeAt(i+13) | 0;
+    out[i+14] = bin.charCodeAt(i+14) | 0;
+    out[i+15] = bin.charCodeAt(i+15) | 0;
+    i = (i + 16) | 0;
   }
   while (i < len) {
     out[i] = bin.charCodeAt(i) | 0;
@@ -73,23 +82,40 @@ function b64dec(s) {
   return out;
 }
 
-// ============ UUID 验证 ============
+// ============ UUID（8x2展开 + 短路优化） ============
 function chkUUID(d, o) {
   const o0 = o | 0;
-  return (
-    (((d[o0] ^ UUID[0]) | (d[o0+1] ^ UUID[1]) | (d[o0+2] ^ UUID[2]) | (d[o0+3] ^ UUID[3])) | 0) === 0 &&
-    (((d[o0+4] ^ UUID[4]) | (d[o0+5] ^ UUID[5]) | (d[o0+6] ^ UUID[6]) | (d[o0+7] ^ UUID[7])) | 0) === 0 &&
-    (((d[o0+8] ^ UUID[8]) | (d[o0+9] ^ UUID[9]) | (d[o0+10] ^ UUID[10]) | (d[o0+11] ^ UUID[11])) | 0) === 0 &&
-    (((d[o0+12] ^ UUID[12]) | (d[o0+13] ^ UUID[13]) | (d[o0+14] ^ UUID[14]) | (d[o0+15] ^ UUID[15])) | 0) === 0
-  );
+  const d0 = d[o0] ^ UUID[0];
+  const d1 = d[o0+1] ^ UUID[1];
+  const d2 = d[o0+2] ^ UUID[2];
+  const d3 = d[o0+3] ^ UUID[3];
+  if ((d0 | d1 | d2 | d3) !== 0) return false;
+  
+  const d4 = d[o0+4] ^ UUID[4];
+  const d5 = d[o0+5] ^ UUID[5];
+  const d6 = d[o0+6] ^ UUID[6];
+  const d7 = d[o0+7] ^ UUID[7];
+  if ((d4 | d5 | d6 | d7) !== 0) return false;
+  
+  const d8 = d[o0+8] ^ UUID[8];
+  const d9 = d[o0+9] ^ UUID[9];
+  const d10 = d[o0+10] ^ UUID[10];
+  const d11 = d[o0+11] ^ UUID[11];
+  if ((d8 | d9 | d10 | d11) !== 0) return false;
+  
+  const d12 = d[o0+12] ^ UUID[12];
+  const d13 = d[o0+13] ^ UUID[13];
+  const d14 = d[o0+14] ^ UUID[14];
+  const d15 = d[o0+15] ^ UUID[15];
+  return (d12 | d13 | d14 | d15) === 0;
 }
 
-// ============ VLESS 解析（保留数组 join - 已验证更快） ============
+// ============ VLESS（快速路径优先） ============
 function parseVL(d) {
-  const result = new VLESSResult();
   const len = d.length | 0;
   
-  if (len < 22 || d[0] !== 0) return VFAIL;
+  if (len < 22) return VFAIL;
+  if (d[0] !== 0) return VFAIL;
   if (!chkUUID(d, 1)) return VFAIL;
   
   const alen = d[17] | 0;
@@ -104,57 +130,58 @@ function parseVL(d) {
   if (aoff >= len) return VFAIL;
   
   const atype = d[aoff] | 0;
-  let host = '';
-  let end = 0;
+  const result = new VLESSResult();
+  result.ok = true;
+  result.port = port;
   
+  // 快速路径：IPv4（最常见）
   if (atype === 1) {
-    end = (aoff + 5) | 0;
+    const end = (aoff + 5) | 0;
     if (end > len) return VFAIL;
-    const a = d[aoff+1] | 0;
-    const b = d[aoff+2] | 0;
-    const c = d[aoff+3] | 0;
-    const e = d[aoff+4] | 0;
-    host = `${a}.${b}.${c}.${e}`;
-  } else if (atype === 2) {
-    if ((aoff + 2) > len) return VFAIL;
-    const dlen = d[aoff+1] | 0;
-    end = (aoff + 2 + dlen) | 0;
-    if (end > len) return VFAIL;
-    host = DEC.decode(d.subarray(aoff + 2, end));
-  } else if (atype === 3) {
-    end = (aoff + 17) | 0;
-    if (end > len) return VFAIL;
-    const v = new DataView(d.buffer, d.byteOffset + aoff + 1, 16);
-    // 保留数组 join - 单次分配，单次拼接
-    const parts = new Array(8);
-    parts[0] = v.getUint16(0).toString(16);
-    parts[1] = v.getUint16(2).toString(16);
-    parts[2] = v.getUint16(4).toString(16);
-    parts[3] = v.getUint16(6).toString(16);
-    parts[4] = v.getUint16(8).toString(16);
-    parts[5] = v.getUint16(10).toString(16);
-    parts[6] = v.getUint16(12).toString(16);
-    parts[7] = v.getUint16(14).toString(16);
-    host = parts.join(':');
-  } else {
-    return VFAIL;
+    result.host = `${d[aoff+1]}.${d[aoff+2]}.${d[aoff+3]}.${d[aoff+4]}`;
+    result.off = end;
+    return result;
   }
   
-  if (end > len) return VFAIL;
+  // 中速路径：Domain
+  if (atype === 2) {
+    if ((aoff + 2) > len) return VFAIL;
+    const dlen = d[aoff+1] | 0;
+    const end = (aoff + 2 + dlen) | 0;
+    if (end > len) return VFAIL;
+    result.host = DEC.decode(d.subarray(aoff + 2, end));
+    result.off = end;
+    return result;
+  }
   
-  result.ok = true;
-  result.host = host;
-  result.port = port;
-  result.off = end;
-  return result;
+  // 慢速路径：IPv6
+  if (atype === 3) {
+    const end = (aoff + 17) | 0;
+    if (end > len) return VFAIL;
+    const v = new DataView(d.buffer, d.byteOffset + aoff + 1, 16);
+    result.host = [
+      v.getUint16(0).toString(16),
+      v.getUint16(2).toString(16),
+      v.getUint16(4).toString(16),
+      v.getUint16(6).toString(16),
+      v.getUint16(8).toString(16),
+      v.getUint16(10).toString(16),
+      v.getUint16(12).toString(16),
+      v.getUint16(14).toString(16)
+    ].join(':');
+    result.off = end;
+    return result;
+  }
+  
+  return VFAIL;
 }
 
-// ============ TCP 连接 ============
+// ============ TCP连接 ============
 async function dial(host, port, fb) {
-  const h = fb ? PROXY_HOST : host;
-  const p = (fb ? PROXY_PORT : port) | 0;
-  
-  const sock = connect({hostname: h, port: p}, {allowHalfOpen: false});
+  const sock = connect({
+    hostname: fb ? PROXY_HOST : host, 
+    port: (fb ? PROXY_PORT : port) | 0
+  }, {allowHalfOpen: false});
   
   let tid = 0;
   try {
@@ -163,13 +190,13 @@ async function dial(host, port, fb) {
       new Promise((_, rej) => { tid = setTimeout(rej, TIMEOUT) | 0; })
     ]);
   } finally {
-    if (tid !== 0) clearTimeout(tid);
+    if (tid) clearTimeout(tid);
   }
   
   return sock;
 }
 
-// ============ 状态（固定形状，无动态方法） ============
+// ============ 状态 ============
 function State(ws, tcp) {
   this.ws = ws;
   this.tcp = tcp;
@@ -191,77 +218,84 @@ State.prototype.kill = function() {
   });
 };
 
-// ============ 上行（纯优化：窗口批量，无额外状态） ============
+// ============ 上行（环形缓冲 + 位运算索引） ============
 function Uplink(s, w) {
   this.s = s;
   this.w = w;
-  this.q = [];
+  this.q = new Array(Q_SIZE);
+  this.qh = 0;
+  this.qt = 0;
   this.qb = 0;
   this.lock = false;
 }
 
 Uplink.prototype.push = function(chunk) {
-  const s = this.s;
-  if (s.dead) return;
+  if (this.s.dead) return;
   
   const len = chunk.length | 0;
-  const qlen = this.q.length | 0;
-  const qb = this.qb | 0;
+  const qsize = ((this.qt - this.qh) & Q_MASK) | 0;
   
-  if (qlen >= Q_MAX || qb > QB_MAX) {
-    s.kill();
+  if (qsize >= Q_MASK || this.qb > QB_MAX) {
+    this.s.kill();
     return;
   }
   
-  this.q.push(chunk);
-  this.qb = (qb + len) | 0;
+  this.q[this.qt & Q_MASK] = chunk;
+  this.qt = (this.qt + 1) | 0;
+  this.qb = (this.qb + len) | 0;
   
-  const flush = len > 8192 || this.qb >= MERGE_MAX || qlen >= 15;
+  const trigger = (len > 8192 | (this.qb >= MERGE_MAX) | (qsize >= 15)) | 0;
   
-  if (!this.lock && flush) {
+  if (trigger & ~this.lock) {
     this.drain();
   } else if (!this.lock) {
-    const self = this;
-    queueMicrotask(() => self.drain());
+    queueMicrotask(() => this.drain());
   }
 };
 
 Uplink.prototype.drain = async function() {
-  if (this.lock || this.s.dead || this.q.length === 0) return;
+  if (this.lock | this.s.dead) return;
+  
+  const qh = this.qh | 0;
+  const qt = this.qt | 0;
+  if (qh === qt) return;
   
   this.lock = true;
   const s = this.s;
   const w = this.w;
-  const q = this.q;
   
-  while (q.length > 0 && !s.dead) {
-    const qlen = q.length | 0;
+  while ((this.qh !== this.qt) & !s.dead) {
+    const qsize = ((this.qt - this.qh) & Q_MASK) | 0;
     
     let bc = 0;
     let bb = 0;
+    let idx = this.qh | 0;
     
-    for (let i = 0; i < qlen && bc < 16; i = (i + 1) | 0) {
-      const clen = q[i].length | 0;
-      if (bb > 0 && (bb + clen) > MERGE_MAX) break;
+    while ((bc < 16) & (bc < qsize)) {
+      const clen = this.q[idx & Q_MASK].length | 0;
+      if ((bb > 0) & ((bb + clen) > MERGE_MAX)) break;
       bb = (bb + clen) | 0;
       bc = (bc + 1) | 0;
+      idx = (idx + 1) | 0;
     }
-    
-    const batch = q.splice(0, bc);
-    this.qb = (this.qb - bb) | 0;
     
     let data;
     if (bc === 1) {
-      data = batch[0];
+      data = this.q[this.qh & Q_MASK];
     } else {
       data = new Uint8Array(bb);
       let off = 0;
-      for (let i = 0; i < bc; i = (i + 1) | 0) {
-        const c = batch[i];
+      let i = 0;
+      while (i < bc) {
+        const c = this.q[(this.qh + i) & Q_MASK];
         data.set(c, off);
         off = (off + c.length) | 0;
+        i = (i + 1) | 0;
       }
     }
+    
+    this.qh = (this.qh + bc) | 0;
+    this.qb = (this.qb - bb) | 0;
     
     try {
       await w.ready;
@@ -276,7 +310,7 @@ Uplink.prototype.drain = async function() {
   this.lock = false;
 };
 
-// ============ 下行（纯优化：限制轮询，无缓冲池） ============
+// ============ 下行（零分配首帧 + 函数内联） ============
 function Downlink(s, ws, r) {
   this.s = s;
   this.ws = ws;
@@ -289,7 +323,7 @@ Downlink.prototype.run = async function() {
   const s = this.s;
   const ws = this.ws;
   const r = this.r;
-  let first = this.first;
+  let first = true;
   
   try {
     while (!s.dead) {
@@ -298,30 +332,33 @@ Downlink.prototype.run = async function() {
       if (buf > WS_HI) {
         let cnt = 0;
         await new Promise(res => {
-          const chk = () => {
-            if (s.dead || ws.bufferedAmount < WS_LO) {
+          function chk() {
+            const dead = s.dead | 0;
+            const low = (ws.bufferedAmount < WS_LO) | 0;
+            if (dead | low) {
               res();
-              return;
-            }
-            cnt = (cnt + 1) | 0;
-            if (cnt > BP_LIMIT) {
-              setTimeout(res, 1);
             } else {
-              queueMicrotask(chk);
+              cnt = (cnt + 1) | 0;
+              if (cnt > BP_LIMIT) {
+                setTimeout(res, 1);
+              } else {
+                queueMicrotask(chk);
+              }
             }
-          };
+          }
           chk();
         });
         if (s.dead) break;
       }
       
       buf = ws.bufferedAmount | 0;
-      const qt = (buf < WS_LO) ? BATCH_HI : BATCH_LO;
+      const qt = ((buf < WS_LO) ? BATCH_HI : BATCH_LO) | 0;
       
-      for (let i = 0; i < qt && !s.dead; i = (i + 1) | 0) {
+      let i = 0;
+      while ((i < qt) & !s.dead) {
         const {done, value} = await r.read();
         
-        if (done || s.dead) {
+        if (done) {
           s.kill();
           return;
         }
@@ -329,7 +366,8 @@ Downlink.prototype.run = async function() {
         if (first) {
           const vlen = value.length | 0;
           const frame = new Uint8Array((vlen + 2) | 0);
-          frame.set(VHDR, 0);
+          frame[0] = 0;
+          frame[1] = 0;
           frame.set(value, 2);
           ws.send(frame);
           first = false;
@@ -337,8 +375,8 @@ Downlink.prototype.run = async function() {
           ws.send(value);
         }
         
-        buf = ws.bufferedAmount | 0;
-        if (buf > WS_HI) break;
+        i = (i + 1) | 0;
+        if (ws.bufferedAmount > WS_HI) break;
       }
     }
   } catch {
@@ -349,6 +387,19 @@ Downlink.prototype.run = async function() {
     });
   }
 };
+
+// ============ 事件处理器（函数提升） ============
+function onMessage(up, e) {
+  up.push(new Uint8Array(e.data));
+}
+
+function onClose(s) {
+  s.kill();
+}
+
+function onError(s) {
+  s.kill();
+}
 
 // ============ 主入口 ============
 export default {
@@ -382,23 +433,16 @@ export default {
     
     const dlen = data.length | 0;
     const doff = vl.off | 0;
-    const init = dlen > doff ? data.subarray(doff) : EMPTY;
+    const init = (dlen > doff) ? data.subarray(doff) : EMPTY;
     
-    const writer = tcp.writable.getWriter();
-    const reader = tcp.readable.getReader();
-    
-    const up = new Uplink(state, writer);
+    const up = new Uplink(state, tcp.writable.getWriter());
     if (init.length > 0) up.push(init);
     
-    const onMsg = e => up.push(new Uint8Array(e.data));
-    const onClose = () => state.kill();
-    const onErr = () => state.kill();
+    server.addEventListener('message', e => onMessage(up, e));
+    server.addEventListener('close', () => onClose(state));
+    server.addEventListener('error', () => onError(state));
     
-    server.addEventListener('message', onMsg);
-    server.addEventListener('close', onClose);
-    server.addEventListener('error', onErr);
-    
-    new Downlink(state, server, reader);
+    new Downlink(state, server, tcp.readable.getReader());
     
     return new Response(null, {status: 101, webSocket: client});
   }
