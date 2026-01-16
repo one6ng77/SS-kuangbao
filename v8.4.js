@@ -31,7 +31,7 @@ function VLESSResult() {
 }
 
 const VFAIL = Object.freeze(new VLESSResult());
-const B64FAIL = new Uint8Array(0);
+const B64FAIL = EMPTY;
 
 function b64dec(s) {
   let bin;
@@ -119,16 +119,15 @@ function parseVL(d) {
     const end = (aoff + 17) | 0;
     if (end > len) return VFAIL;
     const v = new DataView(d.buffer, d.byteOffset + aoff + 1, 16);
-    r.host = [
-      v.getUint16(0).toString(16),
-      v.getUint16(2).toString(16),
-      v.getUint16(4).toString(16),
-      v.getUint16(6).toString(16),
-      v.getUint16(8).toString(16),
-      v.getUint16(10).toString(16),
-      v.getUint16(12).toString(16),
-      v.getUint16(14).toString(16)
-    ].join(':');
+    const p0 = v.getUint16(0).toString(16);
+    const p1 = v.getUint16(2).toString(16);
+    const p2 = v.getUint16(4).toString(16);
+    const p3 = v.getUint16(6).toString(16);
+    const p4 = v.getUint16(8).toString(16);
+    const p5 = v.getUint16(10).toString(16);
+    const p6 = v.getUint16(12).toString(16);
+    const p7 = v.getUint16(14).toString(16);
+    r.host = p0 + ':' + p1 + ':' + p2 + ':' + p3 + ':' + p4 + ':' + p5 + ':' + p6 + ':' + p7;
     r.off = end;
     return r;
   }
@@ -184,6 +183,7 @@ function Uplink(s, w) {
   this.qt = 0;
   this.qb = 0;
   this.lock = false;
+  this.scheduled = false;
 }
 
 Uplink.prototype.push = function(chunk) {
@@ -193,46 +193,49 @@ Uplink.prototype.push = function(chunk) {
   const qh = this.qh | 0;
   const qt = this.qt | 0;
   const next = (qt + 1) & Q_MASK;
+  const newQb = (this.qb + len) | 0;
   
-  if (next === qh || this.qb > QB_MAX) {
+  if (next === qh || newQb > QB_MAX) {
     this.s.kill();
     return;
   }
   
   this.q[qt] = chunk;
   this.qt = next;
-  this.qb = (this.qb + len) | 0;
+  this.qb = newQb;
   
-  const qsize = (qt - qh + Q_SIZE) & Q_MASK;
+  const qsize = ((qt - qh + Q_SIZE) & Q_MASK) | 0;
   
-  if (!this.lock && (len > 8192 || this.qb >= MERGE_MAX || qsize >= 15)) {
+  if (!this.lock && (len > 8192 || newQb >= MERGE_MAX || qsize >= 15)) {
     this.drain();
-  } else if (!this.lock) {
-    queueMicrotask(() => this.drain());
+  } else if (!this.scheduled) {
+    this.scheduled = true;
+    queueMicrotask(() => {
+      this.scheduled = false;
+      this.drain();
+    });
   }
 };
 
 Uplink.prototype.drain = async function() {
-  const qh = this.qh | 0;
-  const qt = this.qt | 0;
-  
-  if (this.lock || this.s.dead || qh === qt) return;
+  if (this.lock || this.s.dead || this.qh === this.qt) return;
   
   this.lock = true;
   const s = this.s;
   const w = this.w;
+  const q = this.q;
   
   while (this.qh !== this.qt && !s.dead) {
     const qh = this.qh | 0;
     const qt = this.qt | 0;
-    const qsize = (qt - qh + Q_SIZE) & Q_MASK;
+    const qsize = ((qt - qh + Q_SIZE) & Q_MASK) | 0;
     
     let bc = 0;
     let bb = 0;
     
     while (bc < 16 && bc < qsize) {
       const idx = (qh + bc) & Q_MASK;
-      const clen = this.q[idx].length | 0;
+      const clen = q[idx].length | 0;
       if (bb > 0 && (bb + clen) > MERGE_MAX) break;
       bb = (bb + clen) | 0;
       bc = (bc + 1) | 0;
@@ -240,14 +243,15 @@ Uplink.prototype.drain = async function() {
     
     let data;
     if (bc === 1) {
-      data = this.q[qh];
+      data = q[qh];
     } else {
       data = new Uint8Array(bb);
       let off = 0;
       for (let i = 0; i < bc; i = (i + 1) | 0) {
         const idx = (qh + i) & Q_MASK;
-        data.set(this.q[idx], off);
-        off = (off + this.q[idx].length) | 0;
+        const chunk = q[idx];
+        data.set(chunk, off);
+        off = (off + chunk.length) | 0;
       }
     }
     
@@ -271,6 +275,7 @@ function Downlink(s, ws, r) {
   this.s = s;
   this.ws = ws;
   this.r = r;
+  this.first = true;
   this.run();
 }
 
@@ -278,7 +283,7 @@ Downlink.prototype.run = async function() {
   const s = this.s;
   const ws = this.ws;
   const r = this.r;
-  let first = true;
+  let first = this.first;
   
   try {
     while (!s.dead) {
@@ -317,12 +322,13 @@ Downlink.prototype.run = async function() {
         
         if (first) {
           const vlen = value.length | 0;
-          const frame = new Uint8Array((vlen + 2) | 0);
+          const frame = new Uint8Array(vlen + 2);
           frame[0] = 0;
           frame[1] = 0;
           frame.set(value, 2);
           ws.send(frame);
           first = false;
+          this.first = false;
         } else {
           ws.send(value);
         }
@@ -338,14 +344,6 @@ Downlink.prototype.run = async function() {
     });
   }
 };
-
-function onMsg(up, e) {
-  up.push(new Uint8Array(e.data));
-}
-
-function onKill(s) {
-  s.kill();
-}
 
 export default {
   async fetch(req) {
@@ -382,9 +380,9 @@ export default {
     
     if (init.length > 0) up.push(init);
     
-    server.addEventListener('message', e => onMsg(up, e));
-    server.addEventListener('close', () => onKill(state));
-    server.addEventListener('error', () => onKill(state));
+    server.addEventListener('message', e => up.push(new Uint8Array(e.data)));
+    server.addEventListener('close', () => state.kill());
+    server.addEventListener('error', () => state.kill());
     
     new Downlink(state, server, tcp.readable.getReader());
     
